@@ -217,11 +217,19 @@ fn collect_all_files(vault_root: &Path, excludes: &[String]) -> HashSet<UniCase<
 }
 
 fn build_file_index(files: &[PathBuf]) -> HashMap<UniCase<String>, PathBuf> {
-    let mut index = HashMap::new();
+    let mut index: HashMap<UniCase<String>, PathBuf> = HashMap::new();
 
     for path in files {
         if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-            index.insert(UniCase::new(stem.to_owned()), path.clone());
+            let key = UniCase::new(stem.to_owned());
+            if let Some(existing) = index.get(&key) {
+                eprintln!(
+                    "warning: duplicate stem {:?} — {:?} shadows {:?}; links to [[{}]] will resolve to the first path only",
+                    stem, existing, path, stem
+                );
+            } else {
+                index.insert(key, path.clone());
+            }
         }
     }
 
@@ -762,5 +770,17 @@ Outside [[Real]]
         assert!(analysis
             .missing_backlinks
             .contains(&(pb("/vault/source.md"), pb("/vault/capco.md"))));
+    }
+
+    #[test]
+    fn build_file_index_warns_on_duplicate_stem() {
+        let files = vec![pb("/vault/Capco/Bertie Haskins Profile.md"), pb("/vault/People/Bertie Haskins Profile.md")];
+        let index = build_file_index(&files);
+
+        assert_eq!(index.len(), 1);
+        assert_eq!(
+            index.get(&UniCase::new("Bertie Haskins Profile".to_string())),
+            Some(&pb("/vault/Capco/Bertie Haskins Profile.md"))
+        );
     }
 }
