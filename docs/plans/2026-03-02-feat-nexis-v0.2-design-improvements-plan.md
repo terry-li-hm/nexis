@@ -1,7 +1,7 @@
 ---
 title: "feat: nexis v0.2 — design improvements from consilium review"
 type: feat
-status: active
+status: completed
 date: 2026-03-02
 ---
 
