@@ -37,6 +37,10 @@ struct Cli {
     format: OutputFormat,
     #[arg(long, help = "Alias for --format json")]
     json: bool,
+    #[arg(long, help = "convert broken wikilinks to plain text in place")]
+    unlink: bool,
+    #[arg(long, help = "with --unlink: preview changes without writing")]
+    dry_run: bool,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, ValueEnum)]
@@ -106,6 +110,15 @@ fn main() -> ExitCode {
 
     let analysis = analyze_graph(&files, &results, &index, &known_assets);
     let has_findings = !(analysis.orphans.is_empty() && analysis.broken_links.is_empty());
+
+    if cli.unlink {
+        let (unlinked, changed) = unlink_broken_links(&analysis.broken_links, cli.dry_run);
+        if cli.dry_run {
+            eprintln!("Dry run: would unlink {unlinked} broken links across {changed} files");
+        } else {
+            eprintln!("Unlinked {unlinked} broken links across {changed} files");
+        }
+    }
 
     match format {
         OutputFormat::Human => {
@@ -348,6 +361,81 @@ fn extract_wikilinks(content: &str) -> (Vec<String>, Vec<String>) {
     }
 
     (links, embeds)
+}
+
+/// Convert broken wikilinks to plain text in source files.
+/// Returns (links_unlinked, files_changed).
+fn unlink_broken_links(broken_links: &[(PathBuf, String)], dry_run: bool) -> (usize, usize) {
+    // Group broken targets by source file for a single read/write pass per file.
+    let mut by_source: HashMap<&PathBuf, HashSet<&str>> = HashMap::new();
+    for (source, target) in broken_links {
+        by_source.entry(source).or_default().insert(target.as_str());
+    }
+
+    let mut total_unlinked = 0usize;
+    let mut files_changed = 0usize;
+
+    for (source, targets) in &by_source {
+        let content = match fs::read_to_string(source) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("warning: could not read {:?}: {}", source, e);
+                continue;
+            }
+        };
+
+        // Strip code regions + HTML comments while preserving byte offsets.
+        let stripped = strip_code_regions(&content);
+        let stripped = strip_html_comments(&stripped);
+
+        // (byte_start, byte_end, replacement_text)
+        let mut replacements: Vec<(usize, usize, String)> = Vec::new();
+
+        for caps in wikilink_regex().captures_iter(&stripped) {
+            let marker = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+            if marker == "!" {
+                continue;
+            }
+
+            let full_match = caps.get(0).expect("wikilink regex provides full match");
+            let raw_target = caps.get(2).map(|m| m.as_str()).unwrap_or("");
+            let alias = caps.get(3).map(|m| m.as_str());
+
+            let normalized = match normalize_target(raw_target) {
+                Some(n) => n,
+                None => continue,
+            };
+
+            if !targets.contains(normalized.as_str()) {
+                continue;
+            }
+
+            let replacement = alias.unwrap_or(&normalized).to_string();
+            replacements.push((full_match.start(), full_match.end(), replacement));
+        }
+
+        if replacements.is_empty() {
+            continue;
+        }
+
+        replacements.sort_by(|a, b| b.0.cmp(&a.0));
+
+        let mut new_content = content.clone();
+        for (start, end, replacement) in &replacements {
+            new_content.replace_range(*start..*end, replacement);
+        }
+
+        total_unlinked += replacements.len();
+        files_changed += 1;
+
+        if !dry_run {
+            if let Err(e) = fs::write(source, &new_content) {
+                eprintln!("warning: could not write {:?}: {}", source, e);
+            }
+        }
+    }
+
+    (total_unlinked, files_changed)
 }
 
 fn analyze_graph(
@@ -782,5 +870,25 @@ Outside [[Real]]
             index.get(&UniCase::new("Bertie Haskins Profile".to_string())),
             Some(&pb("/vault/Capco/Bertie Haskins Profile.md"))
         );
+    }
+
+    #[test]
+    fn unlink_broken_links_basic() {
+        let path = PathBuf::from("/tmp/nexis-test-unlink.md");
+        let content = "See [[Dead Note]] and [[Dead Note|Alias]] and [[Live Note]].\n";
+        fs::write(&path, content).unwrap();
+
+        let broken = vec![(path.clone(), "Dead Note".to_string())];
+        let (unlinked, changed) = unlink_broken_links(&broken, false);
+
+        assert_eq!(unlinked, 2);
+        assert_eq!(changed, 1);
+
+        let result = fs::read_to_string(&path).unwrap();
+        assert!(result.contains("Dead Note") && !result.contains("[[Dead Note]]"));
+        assert!(result.contains("Alias") && !result.contains("[[Dead Note|Alias]]"));
+        assert!(result.contains("[[Live Note]]"));
+
+        let _ = fs::remove_file(&path);
     }
 }
