@@ -5,6 +5,7 @@ use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{self, IsTerminal};
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::OnceLock;
@@ -16,12 +17,19 @@ use walkdir::WalkDir;
 struct Cli {
     /// Vault root directory
     path: PathBuf,
-    #[arg(long)]
-    backlinks: bool, // show missing backlinks only
+    #[arg(
+        long,
+        help = "show asymmetric links (A links to B but B does not link back)"
+    )]
+    asymmetry: bool,
     #[arg(long)]
     orphans: bool, // show orphans only
     #[arg(long)]
     broken: bool, // show broken links only
+    #[arg(long)]
+    details: bool, // show full item lists (default is summary counts only)
+    #[arg(long)]
+    exclude: Vec<String>, // extra dirs to skip
     #[arg(long, value_enum, default_value_t = OutputFormat::Human)]
     format: OutputFormat,
     #[arg(long, help = "Alias for --format json")]
@@ -38,6 +46,8 @@ enum OutputFormat {
 struct Report {
     vault: String,
     total_files: usize,
+    total_assets: usize,
+    embed_count: usize,
     missing_backlinks: Vec<MissingBacklink>,
     orphans: Vec<String>,
     broken_links: Vec<BrokenLink>,
@@ -59,6 +69,7 @@ struct Analysis {
     missing_backlinks: Vec<(PathBuf, PathBuf)>,
     orphans: Vec<PathBuf>,
     broken_links: Vec<(PathBuf, String)>,
+    embed_count: usize,
 }
 
 fn main() -> ExitCode {
@@ -73,39 +84,49 @@ fn main() -> ExitCode {
         Ok(path) => path,
         Err(err) => {
             eprintln!("Fatal error: {err}");
-            return ExitCode::from(1);
+            return ExitCode::from(2);
         }
     };
 
-    let files = collect_markdown_files(&vault_root);
+    let files = collect_markdown_files(&vault_root, cli.exclude.as_slice());
     let index = build_file_index(&files);
+    let known_assets = collect_all_files(&vault_root, cli.exclude.as_slice());
 
-    let results: Vec<(PathBuf, Vec<String>)> = files
+    let results: Vec<(PathBuf, Vec<String>, Vec<String>)> = files
         .par_iter()
         .filter_map(|path| {
             let content = fs::read_to_string(path).ok()?;
-            let links = extract_wikilinks(&content);
-            Some((path.clone(), links))
+            let (links, embeds) = extract_wikilinks(&content);
+            Some((path.clone(), links, embeds))
         })
         .collect();
 
-    let analysis = analyze_graph(&files, &results, &index);
+    let analysis = analyze_graph(&files, &results, &index, &known_assets);
+    let has_findings = !(analysis.orphans.is_empty() && analysis.broken_links.is_empty());
 
     match format {
         OutputFormat::Human => {
-            print_human_report(&vault_root, &analysis, &cli);
-            ExitCode::SUCCESS
+            print_human_report(&vault_root, files.len(), known_assets.len(), &analysis, &cli);
+            if has_findings {
+                ExitCode::from(1)
+            } else {
+                ExitCode::SUCCESS
+            }
         }
         OutputFormat::Json => {
-            let report = build_json_report(&vault_root, files.len(), &analysis);
+            let report = build_json_report(&vault_root, files.len(), known_assets.len(), &analysis);
             match serde_json::to_string_pretty(&report) {
                 Ok(json) => {
                     println!("{json}");
-                    ExitCode::SUCCESS
+                    if has_findings {
+                        ExitCode::from(1)
+                    } else {
+                        ExitCode::SUCCESS
+                    }
                 }
                 Err(err) => {
                     eprintln!("Fatal error: failed to serialize JSON output: {err}");
-                    ExitCode::from(1)
+                    ExitCode::from(2)
                 }
             }
         }
@@ -138,10 +159,21 @@ fn absolute_path(path: &Path) -> PathBuf {
     })
 }
 
-fn collect_markdown_files(vault_root: &Path) -> Vec<PathBuf> {
+fn should_skip_entry(path: &Path, excludes: &[String]) -> bool {
+    path.components().any(|component| {
+        let os = component.as_os_str();
+        os == OsStr::new(".obsidian")
+            || os == OsStr::new(".git")
+            || os == OsStr::new(".trash")
+            || excludes.iter().any(|exclude| os == OsStr::new(exclude))
+    })
+}
+
+fn collect_markdown_files(vault_root: &Path, excludes: &[String]) -> Vec<PathBuf> {
     let mut files: Vec<PathBuf> = WalkDir::new(vault_root)
         .follow_links(false)
         .into_iter()
+        .filter_entry(|entry| !should_skip_entry(entry.path(), excludes))
         .filter_map(|e| e.ok())
         .filter(|entry| entry.file_type().is_file())
         .filter(|entry| {
@@ -157,6 +189,28 @@ fn collect_markdown_files(vault_root: &Path) -> Vec<PathBuf> {
 
     files.sort();
     files
+}
+
+fn collect_all_files(vault_root: &Path, excludes: &[String]) -> HashSet<UniCase<String>> {
+    let mut known_assets: HashSet<UniCase<String>> = HashSet::new();
+
+    for entry in WalkDir::new(vault_root)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|entry| !should_skip_entry(entry.path(), excludes))
+        .filter_map(|e| e.ok())
+        .filter(|entry| entry.file_type().is_file())
+    {
+        let path = entry.path();
+        if let Some(file_name) = path.file_name().and_then(|n| n.to_str()) {
+            known_assets.insert(UniCase::new(file_name.to_owned()));
+        }
+        if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+            known_assets.insert(UniCase::new(stem.to_owned()));
+        }
+    }
+
+    known_assets
 }
 
 fn build_file_index(files: &[PathBuf]) -> HashMap<UniCase<String>, PathBuf> {
@@ -184,7 +238,7 @@ fn inline_code_regex() -> &'static Regex {
 fn wikilink_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
-        Regex::new(r"\[\[([^\]|][^\]]*?)(?:\|([^\]]*))?\]\]").expect("valid wikilink regex")
+        Regex::new(r"(!?)\[\[([^\]|][^\]]*?)(?:\|([^\]]*))?\]\]").expect("valid wikilink regex")
     })
 }
 
@@ -243,20 +297,35 @@ fn normalize_target(raw_target: &str) -> Option<String> {
     }
 }
 
-fn extract_wikilinks(content: &str) -> Vec<String> {
+fn extract_wikilinks(content: &str) -> (Vec<String>, Vec<String>) {
     let stripped = strip_code_regions(content);
+    let mut links = Vec::new();
+    let mut embeds = Vec::new();
 
-    wikilink_regex()
-        .captures_iter(&stripped)
-        .filter_map(|caps| caps.get(1).map(|m| m.as_str()))
-        .filter_map(normalize_target)
-        .collect()
+    for caps in wikilink_regex().captures_iter(&stripped) {
+        let marker = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+        let target = caps
+            .get(2)
+            .map(|m| m.as_str())
+            .and_then(normalize_target);
+
+        if let Some(target) = target {
+            if marker == "!" {
+                embeds.push(target);
+            } else {
+                links.push(target);
+            }
+        }
+    }
+
+    (links, embeds)
 }
 
 fn analyze_graph(
     files: &[PathBuf],
-    parsed_links: &[(PathBuf, Vec<String>)],
+    parsed_links: &[(PathBuf, Vec<String>, Vec<String>)],
     index: &HashMap<UniCase<String>, PathBuf>,
+    known_assets: &HashSet<UniCase<String>>,
 ) -> Analysis {
     let mut outgoing: HashMap<PathBuf, Vec<PathBuf>> = files
         .iter()
@@ -268,10 +337,21 @@ fn analyze_graph(
         .cloned()
         .map(|path| (path, Vec::new()))
         .collect();
+    let mut outgoing_embeds: HashMap<PathBuf, Vec<PathBuf>> = files
+        .iter()
+        .cloned()
+        .map(|path| (path, Vec::new()))
+        .collect();
+    let mut incoming_embeds: HashMap<PathBuf, Vec<PathBuf>> = files
+        .iter()
+        .cloned()
+        .map(|path| (path, Vec::new()))
+        .collect();
 
     let mut broken_set: HashSet<(PathBuf, String)> = HashSet::new();
+    let mut embed_count: usize = 0;
 
-    for (source, links) in parsed_links {
+    for (source, links, embeds) in parsed_links {
         for target_name in links {
             if let Some(target_path) = index.get(&UniCase::new(target_name.clone())) {
                 let target = target_path.clone();
@@ -280,7 +360,25 @@ fn analyze_graph(
                     .or_default()
                     .push(target.clone());
                 incoming.entry(target).or_default().push(source.clone());
-            } else {
+            } else if !known_assets.contains(&UniCase::new(target_name.clone())) {
+                broken_set.insert((source.clone(), target_name.clone()));
+            }
+        }
+
+        for target_name in embeds {
+            embed_count += 1;
+
+            if let Some(target_path) = index.get(&UniCase::new(target_name.clone())) {
+                let target = target_path.clone();
+                outgoing_embeds
+                    .entry(source.clone())
+                    .or_default()
+                    .push(target.clone());
+                incoming_embeds
+                    .entry(target)
+                    .or_default()
+                    .push(source.clone());
+            } else if !known_assets.contains(&UniCase::new(target_name.clone())) {
                 broken_set.insert((source.clone(), target_name.clone()));
             }
         }
@@ -312,6 +410,8 @@ fn analyze_graph(
         .filter(|file| {
             outgoing.get(*file).is_some_and(Vec::is_empty)
                 && incoming.get(*file).is_some_and(Vec::is_empty)
+                && outgoing_embeds.get(*file).is_some_and(Vec::is_empty)
+                && incoming_embeds.get(*file).is_some_and(Vec::is_empty)
         })
         .cloned()
         .collect();
@@ -324,11 +424,12 @@ fn analyze_graph(
         missing_backlinks,
         orphans,
         broken_links,
+        embed_count,
     }
 }
 
 fn should_show_all(cli: &Cli) -> bool {
-    !cli.backlinks && !cli.orphans && !cli.broken
+    !cli.asymmetry && !cli.orphans && !cli.broken
 }
 
 fn relativize(root: &Path, path: &Path) -> String {
@@ -346,9 +447,15 @@ fn pluralize<'a>(count: usize, singular: &'a str, plural: &'a str) -> &'a str {
     }
 }
 
-fn print_human_report(vault_root: &Path, analysis: &Analysis, cli: &Cli) {
+fn print_human_report(
+    vault_root: &Path,
+    total_files: usize,
+    total_assets: usize,
+    analysis: &Analysis,
+    cli: &Cli,
+) {
     let use_color = io::stdout().is_terminal();
-    let show_all = should_show_all(cli);
+    let _show_all = should_show_all(cli);
 
     let heading = |title: &str, count: usize, noun_singular: &str, noun_plural: &str| -> String {
         let noun = pluralize(count, noun_singular, noun_plural);
@@ -360,11 +467,49 @@ fn print_human_report(vault_root: &Path, analysis: &Analysis, cli: &Cli) {
         }
     };
 
-    if show_all || cli.backlinks {
+    let orphans_hint = if cli.details || cli.orphans {
+        ""
+    } else {
+        "   (--orphans to list)"
+    };
+    let broken_hint = if cli.details || cli.broken {
+        ""
+    } else {
+        "   (--broken to list)"
+    };
+
+    println!(
+        "Vault: {}  ({} notes, {} assets)",
+        vault_root.display(),
+        total_files,
+        total_assets
+    );
+    println!("  Orphans        {}{}", analysis.orphans.len(), orphans_hint);
+    println!("  Broken links   {}{}", analysis.broken_links.len(), broken_hint);
+    println!("  Embeds         {}", analysis.embed_count);
+    if cli.asymmetry {
+        let asymmetry_hint = if cli.details || cli.asymmetry {
+            ""
+        } else {
+            "   (--asymmetry to list)"
+        };
+        println!(
+            "  Asymmetric     {}{}",
+            analysis.missing_backlinks.len(),
+            asymmetry_hint
+        );
+    }
+
+    let show_orphans_details = cli.details || cli.orphans;
+    let show_broken_details = cli.details || cli.broken;
+    let show_asymmetry_details = cli.details || cli.asymmetry;
+
+    if show_asymmetry_details {
+        println!();
         println!(
             "{}",
             heading(
-                "Missing Backlinks",
+                "Asymmetric Links",
                 analysis.missing_backlinks.len(),
                 "pair",
                 "pairs"
@@ -379,10 +524,10 @@ fn print_human_report(vault_root: &Path, analysis: &Analysis, cli: &Cli) {
                 .unwrap_or("target");
             println!("  {source_rel} -> {target_rel} ({target_name} does not link back)");
         }
-        println!();
     }
 
-    if show_all || cli.orphans {
+    if show_orphans_details {
+        println!();
         println!(
             "{}",
             heading("Orphans", analysis.orphans.len(), "note", "notes")
@@ -390,10 +535,10 @@ fn print_human_report(vault_root: &Path, analysis: &Analysis, cli: &Cli) {
         for orphan in &analysis.orphans {
             println!("  {}", relativize(vault_root, orphan));
         }
-        println!();
     }
 
-    if show_all || cli.broken {
+    if show_broken_details {
+        println!();
         println!(
             "{}",
             heading("Broken Links", analysis.broken_links.len(), "link", "links")
@@ -401,14 +546,16 @@ fn print_human_report(vault_root: &Path, analysis: &Analysis, cli: &Cli) {
         for (source, target) in &analysis.broken_links {
             println!("  {}: [[{}]]", relativize(vault_root, source), target);
         }
-        println!();
     }
+
 }
 
-fn build_json_report(vault_root: &Path, total_files: usize, analysis: &Analysis) -> Report {
+fn build_json_report(vault_root: &Path, total_files: usize, total_assets: usize, analysis: &Analysis) -> Report {
     Report {
         vault: vault_root.to_string_lossy().into_owned(),
         total_files,
+        total_assets,
+        embed_count: analysis.embed_count,
         missing_backlinks: analysis
             .missing_backlinks
             .iter()
@@ -444,8 +591,9 @@ mod tests {
     #[test]
     fn extract_wikilinks_basic_and_alias() {
         let text = "See [[target]] and [[another target|Alias Here]]";
-        let links = extract_wikilinks(text);
+        let (links, embeds) = extract_wikilinks(text);
         assert_eq!(links, vec!["target", "another target"]);
+        assert!(embeds.is_empty());
     }
 
     #[test]
@@ -460,14 +608,30 @@ Outside [[Real]]
 `[[InInline]]`
 "#;
 
-        let links = extract_wikilinks(text);
+        let (links, embeds) = extract_wikilinks(text);
         assert_eq!(links, vec!["Real"]);
+        assert!(embeds.is_empty());
     }
 
     #[test]
     fn extract_wikilinks_empty_text() {
-        let links = extract_wikilinks("");
+        let (links, embeds) = extract_wikilinks("");
         assert!(links.is_empty());
+        assert!(embeds.is_empty());
+    }
+
+    #[test]
+    fn extract_wikilinks_distinguishes_embeds() {
+        let text = "See [[link]] and ![[embed]] here";
+        let (links, embeds) = extract_wikilinks(text);
+        assert_eq!(links, vec!["link"]);
+        assert_eq!(embeds, vec!["embed"]);
+    }
+
+    #[test]
+    fn exclusions_skip_obsidian_components() {
+        let path = Path::new("/vault/.obsidian/plugins/a.md");
+        assert!(should_skip_entry(path, &[]));
     }
 
     #[test]
@@ -486,14 +650,16 @@ Outside [[Real]]
             (
                 pb("/vault/A.md"),
                 vec!["B".to_string(), "Missing".to_string()],
+                vec![],
             ),
-            (pb("/vault/B.md"), vec![]),
-            (pb("/vault/C.md"), vec!["A".to_string()]),
-            (pb("/vault/D.md"), vec![]),
-            (pb("/vault/E.md"), vec![]),
+            (pb("/vault/B.md"), vec![], vec![]),
+            (pb("/vault/C.md"), vec!["A".to_string()], vec![]),
+            (pb("/vault/D.md"), vec![], vec![]),
+            (pb("/vault/E.md"), vec![], vec![]),
         ];
 
-        let analysis = analyze_graph(&files, &parsed_links, &index);
+        let known_assets = HashSet::new();
+        let analysis = analyze_graph(&files, &parsed_links, &index, &known_assets);
 
         assert_eq!(analysis.missing_backlinks.len(), 2);
         assert!(analysis
@@ -510,6 +676,7 @@ Outside [[Real]]
             analysis.broken_links[0],
             (pb("/vault/A.md"), "Missing".to_string())
         );
+        assert_eq!(analysis.embed_count, 0);
     }
 
     #[test]
@@ -517,8 +684,9 @@ Outside [[Real]]
         let files = vec![pb("/vault/capco.md"), pb("/vault/source.md")];
         let index = build_file_index(&files);
 
-        let parsed_links = vec![(pb("/vault/source.md"), vec!["Capco".to_string()])];
-        let analysis = analyze_graph(&files, &parsed_links, &index);
+        let parsed_links = vec![(pb("/vault/source.md"), vec!["Capco".to_string()], vec![])];
+        let known_assets = HashSet::new();
+        let analysis = analyze_graph(&files, &parsed_links, &index, &known_assets);
 
         assert!(analysis.broken_links.is_empty());
         assert!(analysis
