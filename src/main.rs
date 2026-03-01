@@ -9,6 +9,7 @@ use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::OnceLock;
+use std::time::{Duration, SystemTime};
 use unicase::UniCase;
 use walkdir::WalkDir;
 
@@ -30,6 +31,8 @@ struct Cli {
     details: bool, // show full item lists (default is summary counts only)
     #[arg(long)]
     exclude: Vec<String>, // extra dirs to skip
+    #[arg(long, help = "only show orphans modified within N days")]
+    orphan_days: Option<u64>,
     #[arg(long, value_enum, default_value_t = OutputFormat::Human)]
     format: OutputFormat,
     #[arg(long, help = "Alias for --format json")]
@@ -235,6 +238,11 @@ fn inline_code_regex() -> &'static Regex {
     RE.get_or_init(|| Regex::new(r"`[^`\n]*`").expect("valid inline-code regex"))
 }
 
+fn html_comment_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"(?s)<!--.*?-->").expect("valid html comment regex"))
+}
+
 fn wikilink_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
@@ -262,6 +270,16 @@ fn strip_code_regions(text: &str) -> String {
     }
 
     String::from_utf8(bytes).expect("valid UTF-8 after inline replacement")
+}
+
+fn strip_html_comments(text: &str) -> String {
+    let mut bytes = text.as_bytes().to_vec();
+
+    for mat in html_comment_regex().find_iter(text) {
+        replace_range_with_spaces(&mut bytes, mat.start(), mat.end());
+    }
+
+    String::from_utf8(bytes).expect("valid UTF-8 after html comment replacement")
 }
 
 fn normalize_target(raw_target: &str) -> Option<String> {
@@ -301,6 +319,7 @@ fn normalize_target(raw_target: &str) -> Option<String> {
 
 fn extract_wikilinks(content: &str) -> (Vec<String>, Vec<String>) {
     let stripped = strip_code_regions(content);
+    let stripped = strip_html_comments(&stripped);
     let mut links = Vec::new();
     let mut embeds = Vec::new();
 
@@ -449,6 +468,25 @@ fn pluralize<'a>(count: usize, singular: &'a str, plural: &'a str) -> &'a str {
     }
 }
 
+fn filter_orphans_for_report<'a>(orphans: &'a [PathBuf], orphan_days: Option<u64>) -> Vec<&'a PathBuf> {
+    let Some(days) = orphan_days else {
+        return orphans.iter().collect();
+    };
+
+    let cutoff = SystemTime::now().checked_sub(Duration::from_secs(days.saturating_mul(86_400)));
+
+    orphans
+        .iter()
+        .filter(|orphan| {
+            std::fs::metadata(orphan)
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .zip(cutoff)
+                .is_some_and(|(modified, threshold)| modified >= threshold)
+        })
+        .collect()
+}
+
 fn print_human_report(
     vault_root: &Path,
     total_files: usize,
@@ -458,6 +496,8 @@ fn print_human_report(
 ) {
     let use_color = io::stdout().is_terminal();
     let _show_all = should_show_all(cli);
+    let visible_orphans = filter_orphans_for_report(&analysis.orphans, cli.orphan_days);
+    let visible_orphan_count = visible_orphans.len();
 
     let heading = |title: &str, count: usize, noun_singular: &str, noun_plural: &str| -> String {
         let noun = pluralize(count, noun_singular, noun_plural);
@@ -471,8 +511,10 @@ fn print_human_report(
 
     let orphans_hint = if cli.details || cli.orphans {
         ""
-    } else {
+    } else if cli.orphan_days.is_some() {
         "   (--orphans to list)"
+    } else {
+        "   (--orphan-days N to filter by recency)"
     };
     let broken_hint = if cli.details || cli.broken {
         ""
@@ -486,7 +528,12 @@ fn print_human_report(
         total_files,
         total_assets
     );
-    println!("  Orphans        {}{}", analysis.orphans.len(), orphans_hint);
+    let orphan_total_note = if cli.orphan_days.is_some() && visible_orphan_count < analysis.orphans.len() {
+        format!(" (of {} total)", analysis.orphans.len())
+    } else {
+        String::new()
+    };
+    println!("  Orphans        {}{}{}", visible_orphan_count, orphan_total_note, orphans_hint);
     println!("  Broken links   {}{}", analysis.broken_links.len(), broken_hint);
     println!("  Embeds         {}", analysis.embed_count);
     if cli.asymmetry {
@@ -530,11 +577,16 @@ fn print_human_report(
 
     if show_orphans_details {
         println!();
+        let orphan_heading_title = if let Some(days) = cli.orphan_days {
+            format!("Orphans (\u{2264} {days}d)")
+        } else {
+            "Orphans".to_string()
+        };
         println!(
             "{}",
-            heading("Orphans", analysis.orphans.len(), "note", "notes")
+            heading(&orphan_heading_title, visible_orphan_count, "note", "notes")
         );
-        for orphan in &analysis.orphans {
+        for orphan in &visible_orphans {
             println!("  {}", relativize(vault_root, orphan));
         }
     }
@@ -628,6 +680,22 @@ Outside [[Real]]
         let (links, embeds) = extract_wikilinks(text);
         assert_eq!(links, vec!["link"]);
         assert_eq!(embeds, vec!["embed"]);
+    }
+
+    #[test]
+    fn extract_wikilinks_ignores_html_comments() {
+        let text = r#"
+Outside [[Real]]
+<!-- [[Hidden]] -->
+<!--
+![[HiddenEmbed]]
+[[HiddenToo]]
+-->
+"#;
+
+        let (links, embeds) = extract_wikilinks(text);
+        assert_eq!(links, vec!["Real"]);
+        assert!(embeds.is_empty());
     }
 
     #[test]
