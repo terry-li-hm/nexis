@@ -270,13 +270,15 @@ fn normalize_target(raw_target: &str) -> Option<String> {
         return None;
     }
 
-    let no_anchor = trimmed
+    let after_hash = trimmed
         .split_once('#')
         .map(|(head, _)| head)
-        .unwrap_or(trimmed)
+        .unwrap_or(trimmed);
+
+    let no_anchor = after_hash
         .split_once('^')
         .map(|(head, _)| head)
-        .unwrap_or(trimmed)
+        .unwrap_or(after_hash)
         .trim();
 
     if no_anchor.is_empty() {
