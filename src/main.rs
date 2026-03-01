@@ -63,7 +63,11 @@ struct Analysis {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    let format = if cli.json { OutputFormat::Json } else { cli.format };
+    let format = if cli.json {
+        OutputFormat::Json
+    } else {
+        cli.format
+    };
 
     let vault_root = match validate_vault_path(&cli.path) {
         Ok(path) => path,
@@ -254,10 +258,16 @@ fn analyze_graph(
     parsed_links: &[(PathBuf, Vec<String>)],
     index: &HashMap<UniCase<String>, PathBuf>,
 ) -> Analysis {
-    let mut outgoing: HashMap<PathBuf, Vec<PathBuf>> =
-        files.iter().cloned().map(|path| (path, Vec::new())).collect();
-    let mut incoming: HashMap<PathBuf, Vec<PathBuf>> =
-        files.iter().cloned().map(|path| (path, Vec::new())).collect();
+    let mut outgoing: HashMap<PathBuf, Vec<PathBuf>> = files
+        .iter()
+        .cloned()
+        .map(|path| (path, Vec::new()))
+        .collect();
+    let mut incoming: HashMap<PathBuf, Vec<PathBuf>> = files
+        .iter()
+        .cloned()
+        .map(|path| (path, Vec::new()))
+        .collect();
 
     let mut broken_set: HashSet<(PathBuf, String)> = HashSet::new();
 
@@ -293,7 +303,8 @@ fn analyze_graph(
         }
     }
 
-    let mut missing_backlinks: Vec<(PathBuf, PathBuf)> = missing_backlinks_set.into_iter().collect();
+    let mut missing_backlinks: Vec<(PathBuf, PathBuf)> =
+        missing_backlinks_set.into_iter().collect();
     missing_backlinks.sort_by(|(s1, t1), (s2, t2)| s1.cmp(s2).then_with(|| t1.cmp(t2)));
 
     let mut orphans: Vec<PathBuf> = files
@@ -328,7 +339,11 @@ fn relativize(root: &Path, path: &Path) -> String {
 }
 
 fn pluralize<'a>(count: usize, singular: &'a str, plural: &'a str) -> &'a str {
-    if count == 1 { singular } else { plural }
+    if count == 1 {
+        singular
+    } else {
+        plural
+    }
 }
 
 fn print_human_report(vault_root: &Path, analysis: &Analysis, cli: &Cli) {
@@ -370,12 +385,7 @@ fn print_human_report(vault_root: &Path, analysis: &Analysis, cli: &Cli) {
     if show_all || cli.orphans {
         println!(
             "{}",
-            heading(
-                "Orphans",
-                analysis.orphans.len(),
-                "note",
-                "notes"
-            )
+            heading("Orphans", analysis.orphans.len(), "note", "notes")
         );
         for orphan in &analysis.orphans {
             println!("  {}", relativize(vault_root, orphan));
@@ -386,12 +396,7 @@ fn print_human_report(vault_root: &Path, analysis: &Analysis, cli: &Cli) {
     if show_all || cli.broken {
         println!(
             "{}",
-            heading(
-                "Broken Links",
-                analysis.broken_links.len(),
-                "link",
-                "links"
-            )
+            heading("Broken Links", analysis.broken_links.len(), "link", "links")
         );
         for (source, target) in &analysis.broken_links {
             println!("  {}: [[{}]]", relativize(vault_root, source), target);
@@ -478,7 +483,10 @@ Outside [[Real]]
         let index = build_file_index(&files);
 
         let parsed_links = vec![
-            (pb("/vault/A.md"), vec!["B".to_string(), "Missing".to_string()]),
+            (
+                pb("/vault/A.md"),
+                vec!["B".to_string(), "Missing".to_string()],
+            ),
             (pb("/vault/B.md"), vec![]),
             (pb("/vault/C.md"), vec!["A".to_string()]),
             (pb("/vault/D.md"), vec![]),
@@ -488,21 +496,20 @@ Outside [[Real]]
         let analysis = analyze_graph(&files, &parsed_links, &index);
 
         assert_eq!(analysis.missing_backlinks.len(), 2);
-        assert!(
-            analysis
-                .missing_backlinks
-                .contains(&(pb("/vault/A.md"), pb("/vault/B.md")))
-        );
-        assert!(
-            analysis
-                .missing_backlinks
-                .contains(&(pb("/vault/C.md"), pb("/vault/A.md")))
-        );
+        assert!(analysis
+            .missing_backlinks
+            .contains(&(pb("/vault/A.md"), pb("/vault/B.md"))));
+        assert!(analysis
+            .missing_backlinks
+            .contains(&(pb("/vault/C.md"), pb("/vault/A.md"))));
 
         assert_eq!(analysis.orphans, vec![pb("/vault/D.md"), pb("/vault/E.md")]);
 
         assert_eq!(analysis.broken_links.len(), 1);
-        assert_eq!(analysis.broken_links[0], (pb("/vault/A.md"), "Missing".to_string()));
+        assert_eq!(
+            analysis.broken_links[0],
+            (pb("/vault/A.md"), "Missing".to_string())
+        );
     }
 
     #[test]
@@ -514,10 +521,8 @@ Outside [[Real]]
         let analysis = analyze_graph(&files, &parsed_links, &index);
 
         assert!(analysis.broken_links.is_empty());
-        assert!(
-            analysis
-                .missing_backlinks
-                .contains(&(pb("/vault/source.md"), pb("/vault/capco.md")))
-        );
+        assert!(analysis
+            .missing_backlinks
+            .contains(&(pb("/vault/source.md"), pb("/vault/capco.md"))));
     }
 }
