@@ -9,7 +9,7 @@ use std::process::ExitCode;
 use std::time::{Duration, SystemTime};
 use trama::{
     build_file_index, collect_all_files, collect_markdown_files, extract_wikilinks,
-    normalize_target, pluralize, relativize, should_skip_entry, strip_code_regions,
+    normalize_target, pluralize, relativize, strip_code_regions,
     strip_html_comments, validate_vault_path, wikilink_regex,
 };
 use unicase::UniCase;
@@ -506,6 +506,7 @@ fn build_json_report(vault_root: &Path, total_files: usize, total_assets: usize,
 #[cfg(test)]
 mod tests {
     use super::*;
+    use trama::should_skip_entry;
 
     fn pb(path: &str) -> PathBuf {
         PathBuf::from(path)
