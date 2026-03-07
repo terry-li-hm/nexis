@@ -9,7 +9,7 @@ use std::process::ExitCode;
 use std::time::{Duration, SystemTime};
 use trama::{
     build_file_index, collect_all_files, collect_markdown_files, extract_wikilinks,
-    normalize_target, pluralize, relativize, strip_code_regions,
+    normalize_target, pluralize, read_nexisignore, relativize, strip_code_regions,
     strip_html_comments, validate_vault_path, wikilink_regex,
 };
 use unicase::UniCase;
@@ -96,9 +96,12 @@ fn main() -> ExitCode {
         }
     };
 
-    let files = collect_markdown_files(&vault_root, cli.exclude.as_slice());
+    let mut excludes = read_nexisignore(&vault_root);
+    excludes.extend(cli.exclude.iter().cloned());
+
+    let files = collect_markdown_files(&vault_root, excludes.as_slice());
     let index = build_file_index(&files);
-    let known_assets = collect_all_files(&vault_root, cli.exclude.as_slice());
+    let known_assets = collect_all_files(&vault_root, excludes.as_slice());
 
     let results: Vec<(PathBuf, Vec<String>, Vec<String>)> = files
         .par_iter()

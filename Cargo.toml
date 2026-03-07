@@ -1,6 +1,6 @@
 [package]
 name = "nexis"
-version = "0.2.4"
+version = "0.2.5"
 edition = "2021"
 description = "Fast wikilink and backlink analysis for Obsidian markdown vaults"
 license = "MIT"
@@ -19,7 +19,7 @@ clap       = { version = "4", features = ["derive"] }
 rayon      = "1"
 serde      = { version = "1", features = ["derive"] }
 serde_json = "1"
-trama      = "0.1"
+trama      = "0.1.1"
 unicase    = "2"
 
 [profile.release]
