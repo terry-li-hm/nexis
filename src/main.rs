@@ -216,7 +216,7 @@ fn unlink_broken_links(broken_links: &[(PathBuf, String)], dry_run: bool) -> (us
             continue;
         }
 
-        replacements.sort_by(|a, b| b.0.cmp(&a.0));
+        replacements.sort_by_key(|r| std::cmp::Reverse(r.0));
 
         let mut new_content = content.clone();
         for (start, end, replacement) in &replacements {
@@ -371,7 +371,7 @@ fn should_show_all(cli: &Cli) -> bool {
     !cli.asymmetry && !cli.orphans && !cli.broken
 }
 
-fn filter_orphans_for_report<'a>(orphans: &'a [PathBuf], orphan_days: Option<u64>) -> Vec<&'a PathBuf> {
+fn filter_orphans_for_report(orphans: &[PathBuf], orphan_days: Option<u64>) -> Vec<&PathBuf> {
     let Some(days) = orphan_days else {
         return orphans.iter().collect();
     };
