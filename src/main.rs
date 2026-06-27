@@ -32,6 +32,12 @@ struct Cli {
     details: bool, // show full item lists (default is summary counts only)
     #[arg(long)]
     exclude: Vec<String>, // extra dirs to skip
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "additional vault root(s) whose note names count as valid link targets (e.g. a sibling marks repo); resolves cross-repo wikilinks instead of flagging them broken"
+    )]
+    extern_root: Vec<PathBuf>,
     #[arg(long, help = "only show orphans modified within N days")]
     orphan_days: Option<u64>,
     #[arg(long, value_enum, default_value_t = OutputFormat::Human)]
@@ -102,6 +108,7 @@ fn main() -> ExitCode {
     let files = collect_markdown_files(&vault_root, excludes.as_slice());
     let index = build_file_index(&files);
     let known_assets = collect_all_files(&vault_root, excludes.as_slice());
+    let extern_targets = collect_extern_targets(&cli.extern_root, excludes.as_slice());
 
     let results: Vec<(PathBuf, Vec<String>, Vec<String>)> = files
         .par_iter()
@@ -112,7 +119,7 @@ fn main() -> ExitCode {
         })
         .collect();
 
-    let analysis = analyze_graph(&files, &results, &index, &known_assets);
+    let analysis = analyze_graph(&files, &results, &index, &known_assets, &extern_targets);
     let has_findings = !(analysis.orphans.is_empty() && analysis.broken_links.is_empty());
 
     if cli.unlink {
@@ -229,11 +236,31 @@ fn unlink_broken_links(broken_links: &[(PathBuf, String)], dry_run: bool) -> (us
     (total_unlinked, files_changed)
 }
 
+/// Collect note stems from additional roots (e.g. a sibling marks repo) so that
+/// cross-repo wikilinks resolve instead of being flagged broken. A missing root
+/// is warned and skipped rather than aborting the run.
+fn collect_extern_targets(roots: &[PathBuf], excludes: &[String]) -> HashSet<UniCase<String>> {
+    let mut targets: HashSet<UniCase<String>> = HashSet::new();
+    for root in roots {
+        let root = match validate_vault_path(root) {
+            Ok(path) => path,
+            Err(err) => {
+                eprintln!("warning: skipping --extern-root {}: {err}", root.display());
+                continue;
+            }
+        };
+        let files = collect_markdown_files(&root, excludes);
+        targets.extend(build_file_index(&files).into_keys());
+    }
+    targets
+}
+
 fn analyze_graph(
     files: &[PathBuf],
     parsed_links: &[(PathBuf, Vec<String>, Vec<String>)],
     index: &HashMap<UniCase<String>, PathBuf>,
     known_assets: &HashSet<UniCase<String>>,
+    extern_targets: &HashSet<UniCase<String>>,
 ) -> Analysis {
     let mut outgoing: HashMap<PathBuf, Vec<PathBuf>> = files
         .iter()
@@ -268,7 +295,9 @@ fn analyze_graph(
                     .or_default()
                     .push(target.clone());
                 incoming.entry(target).or_default().push(source.clone());
-            } else if !known_assets.contains(&UniCase::new(target_name.clone())) {
+            } else if !known_assets.contains(&UniCase::new(target_name.clone()))
+                && !extern_targets.contains(&UniCase::new(target_name.clone()))
+            {
                 broken_set.insert((source.clone(), target_name.clone()));
             }
         }
@@ -286,7 +315,9 @@ fn analyze_graph(
                     .entry(target)
                     .or_default()
                     .push(source.clone());
-            } else if !known_assets.contains(&UniCase::new(target_name.clone())) {
+            } else if !known_assets.contains(&UniCase::new(target_name.clone()))
+                && !extern_targets.contains(&UniCase::new(target_name.clone()))
+            {
                 broken_set.insert((source.clone(), target_name.clone()));
             }
         }
@@ -602,7 +633,7 @@ Outside [[Real]]
         ];
 
         let known_assets = HashSet::new();
-        let analysis = analyze_graph(&files, &parsed_links, &index, &known_assets);
+        let analysis = analyze_graph(&files, &parsed_links, &index, &known_assets, &HashSet::new());
 
         assert_eq!(analysis.missing_backlinks.len(), 2);
         assert!(analysis
@@ -629,7 +660,7 @@ Outside [[Real]]
 
         let parsed_links = vec![(pb("/vault/source.md"), vec!["Capco".to_string()], vec![])];
         let known_assets = HashSet::new();
-        let analysis = analyze_graph(&files, &parsed_links, &index, &known_assets);
+        let analysis = analyze_graph(&files, &parsed_links, &index, &known_assets, &HashSet::new());
 
         assert!(analysis.broken_links.is_empty());
         assert!(analysis
@@ -667,5 +698,31 @@ Outside [[Real]]
         assert!(result.contains("[[Live Note]]"));
 
         let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn extern_targets_resolve_cross_repo_links() {
+        let files = vec![pb("/vault/source.md")];
+        let index = build_file_index(&files);
+        let parsed_links = vec![(
+            pb("/vault/source.md"),
+            vec![
+                "finding_exists_in_marks".to_string(),
+                "finding_genuinely_missing".to_string(),
+            ],
+            vec![],
+        )];
+        let known_assets = HashSet::new();
+        let mut extern_targets = HashSet::new();
+        extern_targets.insert(UniCase::new("finding_exists_in_marks".to_string()));
+
+        let analysis = analyze_graph(&files, &parsed_links, &index, &known_assets, &extern_targets);
+
+        // Present in an extern root resolves (not broken); absent everywhere is still broken.
+        assert_eq!(analysis.broken_links.len(), 1);
+        assert_eq!(
+            analysis.broken_links[0],
+            (pb("/vault/source.md"), "finding_genuinely_missing".to_string())
+        );
     }
 }

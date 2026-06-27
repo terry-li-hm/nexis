@@ -1,6 +1,6 @@
 [package]
 name = "nexis"
-version = "0.2.5"
+version = "0.2.6"
 edition = "2021"
 description = "Fast wikilink and backlink analysis for Obsidian markdown vaults"
 license = "MIT"
