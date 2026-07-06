@@ -109,6 +109,7 @@ fn main() -> ExitCode {
     let index = build_file_index(&files);
     let known_assets = collect_all_files(&vault_root, excludes.as_slice());
     let extern_targets = collect_extern_targets(&cli.extern_root, excludes.as_slice());
+    let alias_targets = collect_alias_targets(&files);
 
     let results: Vec<(PathBuf, Vec<String>, Vec<String>)> = files
         .par_iter()
@@ -119,7 +120,7 @@ fn main() -> ExitCode {
         })
         .collect();
 
-    let analysis = analyze_graph(&files, &results, &index, &known_assets, &extern_targets);
+    let analysis = analyze_graph(&files, &results, &index, &known_assets, &extern_targets, &alias_targets);
     let has_findings = !(analysis.orphans.is_empty() && analysis.broken_links.is_empty());
 
     if cli.unlink {
@@ -255,12 +256,100 @@ fn collect_extern_targets(roots: &[PathBuf], excludes: &[String]) -> HashSet<Uni
     targets
 }
 
+/// Extract the YAML frontmatter block (the text between the leading `---`
+/// delimiters), if present.
+fn extract_frontmatter(content: &str) -> Option<&str> {
+    let rest = content.strip_prefix("---")?;
+    let rest = rest.strip_prefix("\r\n").or_else(|| rest.strip_prefix('\n'))?;
+    let end = rest.find("\n---")?;
+    Some(&rest[..end])
+}
+
+fn strip_quotes(value: &str) -> &str {
+    let value = value.trim();
+    value
+        .strip_prefix('"')
+        .and_then(|v| v.strip_suffix('"'))
+        .or_else(|| value.strip_prefix('\'').and_then(|v| v.strip_suffix('\'')))
+        .unwrap_or(value)
+}
+
+/// Parse the `aliases:` key out of a frontmatter block. Supports an inline
+/// array (`aliases: ["A", "B"]`), a YAML block list (`aliases:\n  - A\n  - B`),
+/// and a single bare scalar (`aliases: A`).
+fn parse_aliases(frontmatter: &str) -> Vec<String> {
+    let mut aliases = Vec::new();
+    let mut lines = frontmatter.lines().peekable();
+
+    while let Some(line) = lines.next() {
+        let Some(rest) = line.trim_start().strip_prefix("aliases:") else {
+            continue;
+        };
+        let rest = rest.trim();
+
+        if let Some(inner) = rest.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
+            for item in inner.split(',') {
+                let item = strip_quotes(item);
+                if !item.is_empty() {
+                    aliases.push(item.to_string());
+                }
+            }
+        } else if !rest.is_empty() {
+            let item = strip_quotes(rest);
+            if !item.is_empty() {
+                aliases.push(item.to_string());
+            }
+        } else {
+            while let Some(next_line) = lines.peek() {
+                let trimmed = next_line.trim_start();
+                if let Some(item) = trimmed.strip_prefix("- ") {
+                    let item = strip_quotes(item);
+                    if !item.is_empty() {
+                        aliases.push(item.to_string());
+                    }
+                    lines.next();
+                } else if trimmed.is_empty() {
+                    lines.next();
+                } else {
+                    break;
+                }
+            }
+        }
+        break;
+    }
+
+    aliases
+}
+
+/// Collect every frontmatter `aliases:` value across `files` as valid link
+/// targets, normalized and case-folded the same way as `build_file_index`, so
+/// a wikilink that only resolves via a note's alias (not its basename) is not
+/// flagged broken.
+fn collect_alias_targets(files: &[PathBuf]) -> HashSet<UniCase<String>> {
+    let mut targets = HashSet::new();
+    for path in files {
+        let Ok(content) = fs::read_to_string(path) else {
+            continue;
+        };
+        let Some(frontmatter) = extract_frontmatter(&content) else {
+            continue;
+        };
+        for alias in parse_aliases(frontmatter) {
+            if let Some(normalized) = normalize_target(&alias) {
+                targets.insert(UniCase::new(normalized));
+            }
+        }
+    }
+    targets
+}
+
 fn analyze_graph(
     files: &[PathBuf],
     parsed_links: &[(PathBuf, Vec<String>, Vec<String>)],
     index: &HashMap<UniCase<String>, PathBuf>,
     known_assets: &HashSet<UniCase<String>>,
     extern_targets: &HashSet<UniCase<String>>,
+    alias_targets: &HashSet<UniCase<String>>,
 ) -> Analysis {
     let mut outgoing: HashMap<PathBuf, Vec<PathBuf>> = files
         .iter()
@@ -297,6 +386,7 @@ fn analyze_graph(
                 incoming.entry(target).or_default().push(source.clone());
             } else if !known_assets.contains(&UniCase::new(target_name.clone()))
                 && !extern_targets.contains(&UniCase::new(target_name.clone()))
+                && !alias_targets.contains(&UniCase::new(target_name.clone()))
             {
                 broken_set.insert((source.clone(), target_name.clone()));
             }
@@ -317,6 +407,7 @@ fn analyze_graph(
                     .push(source.clone());
             } else if !known_assets.contains(&UniCase::new(target_name.clone()))
                 && !extern_targets.contains(&UniCase::new(target_name.clone()))
+                && !alias_targets.contains(&UniCase::new(target_name.clone()))
             {
                 broken_set.insert((source.clone(), target_name.clone()));
             }
@@ -633,7 +724,7 @@ Outside [[Real]]
         ];
 
         let known_assets = HashSet::new();
-        let analysis = analyze_graph(&files, &parsed_links, &index, &known_assets, &HashSet::new());
+        let analysis = analyze_graph(&files, &parsed_links, &index, &known_assets, &HashSet::new(), &HashSet::new());
 
         assert_eq!(analysis.missing_backlinks.len(), 2);
         assert!(analysis
@@ -660,7 +751,7 @@ Outside [[Real]]
 
         let parsed_links = vec![(pb("/vault/source.md"), vec!["Capco".to_string()], vec![])];
         let known_assets = HashSet::new();
-        let analysis = analyze_graph(&files, &parsed_links, &index, &known_assets, &HashSet::new());
+        let analysis = analyze_graph(&files, &parsed_links, &index, &known_assets, &HashSet::new(), &HashSet::new());
 
         assert!(analysis.broken_links.is_empty());
         assert!(analysis
@@ -716,7 +807,7 @@ Outside [[Real]]
         let mut extern_targets = HashSet::new();
         extern_targets.insert(UniCase::new("finding_exists_in_marks".to_string()));
 
-        let analysis = analyze_graph(&files, &parsed_links, &index, &known_assets, &extern_targets);
+        let analysis = analyze_graph(&files, &parsed_links, &index, &known_assets, &extern_targets, &HashSet::new());
 
         // Present in an extern root resolves (not broken); absent everywhere is still broken.
         assert_eq!(analysis.broken_links.len(), 1);
@@ -724,5 +815,72 @@ Outside [[Real]]
             analysis.broken_links[0],
             (pb("/vault/source.md"), "finding_genuinely_missing".to_string())
         );
+    }
+
+    #[test]
+    fn parse_aliases_inline_array() {
+        let fm = "aliases: [\"Foo\", \"Bar\"]\n";
+        assert_eq!(
+            parse_aliases(fm),
+            vec!["Foo".to_string(), "Bar".to_string()]
+        );
+    }
+
+    #[test]
+    fn parse_aliases_block_list() {
+        let fm = "aliases:\n  - \"Foo\"\n  - Bar\ntype: note\n";
+        assert_eq!(
+            parse_aliases(fm),
+            vec!["Foo".to_string(), "Bar".to_string()]
+        );
+    }
+
+    #[test]
+    fn parse_aliases_single_scalar() {
+        let fm = "aliases: Foo\n";
+        assert_eq!(parse_aliases(fm), vec!["Foo".to_string()]);
+    }
+
+    #[test]
+    fn parse_aliases_missing_key_returns_empty() {
+        let fm = "title: Something\n";
+        assert!(parse_aliases(fm).is_empty());
+    }
+
+    #[test]
+    fn extract_frontmatter_finds_block() {
+        let content = "---\naliases: [\"Foo\"]\n---\nbody text\n";
+        assert_eq!(
+            extract_frontmatter(content),
+            Some("aliases: [\"Foo\"]")
+        );
+    }
+
+    #[test]
+    fn alias_target_resolves_otherwise_broken_link() {
+        let source = PathBuf::from("/tmp/nexis-test-alias-source.md");
+        let target = PathBuf::from("/tmp/nexis-test-alias-target.md");
+        fs::write(&source, "[[Foo]]").unwrap();
+        fs::write(&target, "---\naliases: [\"Foo\"]\n---\nbody\n").unwrap();
+
+        let alias_targets = collect_alias_targets(&[target.clone()]);
+        let files = vec![source.clone()];
+        let parsed_links = vec![(source.clone(), vec!["Foo".to_string()], vec![])];
+        let index = HashMap::new();
+        let known_assets = HashSet::new();
+        let extern_targets = HashSet::new();
+        let analysis = analyze_graph(
+            &files,
+            &parsed_links,
+            &index,
+            &known_assets,
+            &extern_targets,
+            &alias_targets,
+        );
+
+        assert!(analysis.broken_links.is_empty());
+
+        let _ = fs::remove_file(&source);
+        let _ = fs::remove_file(&target);
     }
 }
